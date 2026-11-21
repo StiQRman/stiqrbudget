@@ -1,0 +1,21 @@
+Take control of your money without surrendering your financial privacy. StiQRbudget is a zero-knowledge, offline-first envelope budgeting and expense tracker designed for people who believe their spending habits belong strictly to them.
+
+ZERO-KNOWLEDGE & POST-QUANTUM HYBRID ENCRYPTION
+- Your financial data is encrypted directly on your device before it ever touches the network.
+- Protected by Post-Quantum Hybrid Encryption (ML-KEM-768 + X25519 + AES-256-GCM) and local PBKDF2-SHA256 key derivation.
+- No bank logins, no account scrapers, no ads, and no tracking SDKs.
+
+SMART ENVELOPE BUDGETING
+- Organize your income into clear, customizable envelopes for bills, groceries, savings, and goals.
+- Automate paycheck allocations with flexible rules: % of Check, Fixed $ Per Check, and Monthly Target funding.
+- Track expenses, transfers, and balances with a fast, distraction-free interface.
+
+PRIVATE QR COLLABORATION
+- Share specific budgets with a partner or family member using end-to-end encrypted QR invites and Ed25519 signatures.
+- Collaborate in real time without ever sharing bank credentials.
+
+OFFLINE-FIRST & DATA SOVEREIGNTY
+- Works seamlessly offline and syncs encrypted ciphertexts across your devices when online.
+- Export your budgets, envelopes, and full transaction history to CSV at any time for free.
+
+Your money. Your keys. 100% private.

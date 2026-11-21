@@ -1,0 +1,1 @@
+Private, zero-knowledge envelope budgeting & expense tracker. No bank logins.

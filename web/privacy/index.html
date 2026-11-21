@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StiQRbudget — Privacy Policy</title>
+  <meta name="description" content="StiQRbudget Privacy Policy: Zero-Knowledge, Post-Quantum Hybrid Encrypted envelope budgeting. No bank scraping, no ads, no tracking." />
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <style>
+    :root {
+      --bg: #0a0e17;
+      --card: #111827;
+      --border: #1f2937;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --accent: #06b6d4;
+      --accent2: #10b981;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+      padding: 2rem 1rem 4rem;
+    }
+    .container {
+      max-width: 780px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.25rem 2rem;
+    }
+    .top-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.9rem;
+      margin-bottom: 1.25rem;
+    }
+    .top-link:hover { text-decoration: underline; }
+    h1 {
+      margin: 0 0 0.5rem;
+      font-size: 2rem;
+      letter-spacing: -0.02em;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 1.75rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .meta a { color: var(--accent); text-decoration: none; }
+    h2 {
+      margin-top: 2rem;
+      font-size: 1.25rem;
+      color: var(--accent2);
+    }
+    h3 {
+      margin-top: 1.25rem;
+      font-size: 1.05rem;
+      color: var(--text);
+    }
+    ul { padding-left: 1.35rem; }
+    li { margin-bottom: 0.5rem; }
+    code {
+      background: #1f2937;
+      padding: 0.15rem 0.4rem;
+      border-radius: 6px;
+      font-size: 0.9em;
+    }
+    a { color: var(--accent); }
+    @media (max-width: 600px) {
+      .container { padding: 1.5rem 1.25rem; }
+      h1 { font-size: 1.6rem; }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <a class="top-link" href="/">&larr; Back to StiQRbudget</a>
+    <h1>StiQRbudget Privacy Policy</h1>
+    <div class="meta">
+      <strong>Effective Date:</strong> November 19, 2026 &nbsp;&bull;&nbsp;
+      <strong>Last Updated:</strong> November 19, 2026<br />
+      <strong>Website:</strong> <a href="https://stiqrbudget.com">https://stiqrbudget.com</a> &nbsp;&bull;&nbsp;
+      <strong>Developer Contact:</strong> <a href="mailto:stiqrapps@gmail.com">stiqrapps@gmail.com</a>
+    </div>
+
+    <h2>1. Our Core Privacy Philosophy: Zero-Knowledge</h2>
+    <p>At StiQRbudget, your financial data belongs exclusively to you.</p>
+    <p>Unlike traditional budgeting apps, <strong>we do not want, collect, track, or sell your personal or financial information</strong>. StiQRbudget was built from the ground up on a <strong>Zero-Knowledge Architecture</strong>, which means that all of your budgets, envelopes, transaction descriptions, amounts, and category balances are encrypted directly on your device before they ever touch the network.</p>
+    <p><strong>We cannot read your financial records, and we cannot sell your data to advertisers, data brokers, or financial institutions—because we do not have the keys to decrypt it.</strong></p>
+
+    <h2>2. Cryptographic Security Standards</h2>
+    <p>Your financial data is protected by industry-standard, <strong>Post-Quantum Hybrid Encryption (ML-KEM-768 + X25519 + AES-256-GCM)</strong> end-to-end client-side cryptography:</p>
+    <ul>
+      <li><strong>AES-256-GCM (Authenticated Encryption):</strong> All transaction records, envelope names, notes, and balance allocations are encrypted on your physical device using AES-256-GCM.</li>
+      <li><strong>Deterministic Key Derivation (PBKDF2-SHA256 &amp; FIPS 203 ML-KEM-768):</strong> When you sign in, your master cryptographic keys, Data Encryption Keys (DEKs), and NIST FIPS 203 ML-KEM-768 post-quantum keypairs are derived locally and deterministically on your device using 60,000 rounds of PBKDF2 with SHA-256 and unique cryptographic salts.</li>
+      <li><strong>Ed25519 Digital Signatures:</strong> Cloud requests and peer-to-peer sync operations are cryptographically signed using Ed25519 keypairs. The server only validates signatures to prevent unauthorized writes; it cannot inspect the payload.</li>
+      <li><strong>Post-Quantum Hybrid Key Exchange (ML-KEM-768 + X25519):</strong> Multi-device synchronization and peer collaboration protect shared budget keys using hybrid NIST FIPS 203 ML-KEM-768 key encapsulation combined with X25519 Diffie-Hellman key exchange, with automatic zero-action upgrades on sync.</li>
+      <li><strong>Client-Isolated Keys:</strong> Your private decryption keys never leave your device in unencrypted form. Neither our servers, our infrastructure providers, nor any third party have access to your keys.</li>
+    </ul>
+
+    <h2>3. Information We Collect (and What We Don't)</h2>
+    <h3>What We NEVER Collect:</h3>
+    <ul>
+      <li><strong>No Bank Account Credentials:</strong> We never ask for your bank login, account numbers, or routing numbers. We do not use third-party bank scrapers (e.g., Plaid, Yodlee, MX).</li>
+      <li><strong>No Financial Details:</strong> We cannot view your income, account balances, spending habits, transaction history, or category titles.</li>
+      <li><strong>No Ad Tracking or Device Profiling:</strong> We do not embed ad SDKs, tracking pixels, or cross-app tracking beacons.</li>
+    </ul>
+
+    <h3>What We Process (Encrypted / Minimal Metadata):</h3>
+    <ul>
+      <li><strong>Account Identifier:</strong> Your email address (normalized and hashed) is used solely for account identification and authentication token routing.</li>
+      <li><strong>Encrypted Blobs:</strong> When multi-device sync is active, our decentralized sync relay (StiQRcloud) stores encrypted ciphertexts. To our servers, your data appears as random, unreadable strings of characters (<code>tc:enc:v1:...</code>).</li>
+      <li><strong>Basic Telemetry / Crash Diagnostics:</strong> If enabled by your operating system (e.g., Google Play crash reports), non-identifying technical diagnostic info (e.g., OS version, crash stack traces) may be received to fix app bugs.</li>
+    </ul>
+
+    <h2>4. In-App Subscriptions &amp; Billing</h2>
+    <p>StiQRbudget may offer optional paid subscriptions for power features.</p>
+    <ul>
+      <li>All financial transactions for app store subscriptions are processed directly and securely by the respective app store (Google Play / Apple App Store).</li>
+      <li>We never see or store your credit card, debit card, or billing information.</li>
+      <li>App stores provide us only with an anonymous purchase token to verify your subscription status.</li>
+    </ul>
+
+    <h2>5. Data Sovereignty, Portability &amp; Account Deletion</h2>
+    <p>You have full ownership of your data at all times.</p>
+    <ul>
+      <li><strong>Free Export:</strong> StiQRbudget provides an in-app <strong>Export to CSV</strong> feature available to all users at zero cost. You can export your unencrypted budgets, envelopes, and transaction history to standard spreadsheets anytime.</li>
+      <li><strong>Account &amp; Data Deletion:</strong> You can delete your envelopes, transactions, or entire account directly inside the app via <strong>Settings &rarr; Delete Account</strong>. Deleting your account permanently purges your encrypted data from our sync relays and clears all local storage on your device. You may also request deletion by emailing <a href="mailto:stiqrapps@gmail.com">stiqrapps@gmail.com</a>.</li>
+    </ul>
+
+    <h2>6. Children's Privacy</h2>
+    <p>StiQRbudget is not directed to individuals under the age of 13. We do not knowingly collect personal information from children.</p>
+
+    <h2>7. Legal Disclaimers &amp; Limitation of Liability</h2>
+    <ul>
+      <li><strong>Educational / Budgeting Tool Only:</strong> StiQRbudget is a software tool for personal budget planning and expense tracking. It does not provide financial, investment, legal, or tax advice. You are solely responsible for managing your financial affairs.</li>
+      <li><strong>No Warranty:</strong> The software is provided "as is" and "as available", without warranty of any kind, express or implied.</li>
+      <li><strong>Responsibility for Keys / Passwords:</strong> Because StiQRbudget is zero-knowledge, <strong>if you lose your account password and master credentials, we cannot reset them or recover your encrypted data for you</strong>. Always keep a secure backup of your credentials.</li>
+    </ul>
+
+    <h2>8. Changes to This Policy</h2>
+    <p>We may update this Privacy Policy from time to time to reflect product updates or legal requirements. Material changes will be noted with an updated "Effective Date" at the top of this document.</p>
+
+    <h2>9. Contact Us</h2>
+    <p>If you have questions, feedback, or concerns regarding your privacy or this policy, please reach out to us at:</p>
+    <ul>
+      <li><strong>Email:</strong> <a href="mailto:stiqrapps@gmail.com">stiqrapps@gmail.com</a></li>
+    </ul>
+  </main>
+</body>
+</html>
