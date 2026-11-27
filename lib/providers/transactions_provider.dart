@@ -207,47 +207,61 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
       final currentUserId = pbService.currentUserId ?? '';
       final txDate = date ?? DateTime.now();
 
-      // Optimistically update category balance in Riverpod state
-      // (amount is negative for expense, positive for income)
-      final catNotifier = _ref.read(categoriesProvider.notifier);
-      catNotifier.updateOptimisticBalances({category.id: amount});
+      final freshCategory = pbService.categories
+              .where((c) => c.id == category.id)
+              .firstOrNull ??
+          _ref.read(categoriesProvider)
+              .where((c) => c.id == category.id)
+              .firstOrNull ??
+          category;
 
-      final optTx = TransactionModel(
-        id: 'opt_${DateTime.now().microsecondsSinceEpoch}',
+      // Hard rule: no envelope may ever go negative
+      final catCents = (freshCategory.balance * 100).round();
+      final deltaCents = (amount * 100).round();
+      if (catCents + deltaCents < 0) {
+        return false;
+      }
+
+      // Generate the canonical record ID once so optimistic state, UndoAction,
+      // PocketBaseService, and cloud sync all share the exact same ID (no duplicates).
+      final txId = pbService.generateRecordId();
+      final tx = TransactionModel(
+        id: txId,
         description: description,
         amount: amount,
         type: type,
-        category: category.id,
+        category: freshCategory.id,
         date: txDate,
         user: currentUserId,
       );
-      addOptimisticTransaction(optTx);
 
-      _setUndoAction(UndoAction(
-        description: 'Log expense to ${category.name}',
-        createdTransactionIds: [optTx.id],
+      // Persist locally in memory first (zero network latency)
+      final created = await pbService.logExpense(
+        tx,
+        freshCategory,
+        syncImmediately: false,
+      );
+
+      // Ensure Riverpod states reflect the exact persisted record & balance idempotently
+      addOptimisticTransaction(created);
+      final updatedCat = pbService.categories
+              .where((c) => c.id == freshCategory.id)
+              .firstOrNull ??
+          freshCategory.copyWith(balance: (catCents + deltaCents) / 100.0);
+      _ref.read(categoriesProvider.notifier).updateOptimisticCategory(updatedCat);
+
+      // categoryBalanceChanges stores the applied delta (negative for expense, positive for income),
+      // which undoLastAction reverses via (currentBalance - delta).
+      await _setUndoAction(UndoAction(
+        description: 'Log expense to ${freshCategory.name}',
+        createdTransactionIds: [created.id],
         updatedTransactions: [],
-        categoryBalanceChanges: {category.id: -amount},
+        categoryBalanceChanges: {freshCategory.id: amount},
       ));
 
-      // Asynchronously persist locally & trigger cloud sync
-      unawaited(() async {
-        try {
-          final tx = TransactionModel(
-            id: '',
-            description: description,
-            amount: amount,
-            type: type,
-            category: category.id,
-            date: optTx.date,
-            user: currentUserId,
-          );
-          await pbService.logExpense(tx, category, syncImmediately: false);
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in addSimpleTransaction: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in addSimpleTransaction: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -266,84 +280,86 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
     try {
       final pbService = _ref.read(pbServiceProvider);
       final currentUserId = pbService.currentUserId ?? '';
+      final txDate = date ?? DateTime.now();
 
-      final List<String> createdTxIds = [];
-      final Map<String, double> balanceChanges = {};
-      final now = DateTime.now();
-      final txDate = date ?? now;
+      final Map<String, Category> freshById = {
+        for (final c in _ref.read(categoriesProvider)) c.id: c,
+        for (final c in pbService.categories) c.id: c,
+      };
 
-      // 1. Optimistic updates immediately to in-memory state
+      // Pre-validate aggregated draw per envelope so no envelope can ever go negative
+      final Map<String, int> totalDrawCentsByCat = {};
       for (final split in splits) {
         final cat = split['category'] as Category;
         final amt = (split['amount'] as num).toDouble();
-        if (amt <= 0) continue;
+        final amtCents = (amt * 100).round();
+        if (amtCents <= 0) continue;
+        totalDrawCentsByCat[cat.id] = (totalDrawCentsByCat[cat.id] ?? 0) + amtCents;
+      }
+      if (totalDrawCentsByCat.isEmpty) return false;
 
-        balanceChanges[cat.id] = (balanceChanges[cat.id] ?? 0.0) - amt;
+      for (final entry in totalDrawCentsByCat.entries) {
+        final freshCat = freshById[entry.key];
+        if (freshCat == null) return false;
+        final availCents = (freshCat.balance * 100).round();
+        if (availCents < entry.value) {
+          return false;
+        }
+      }
 
+      final List<String> createdTxIds = [];
+      final Map<String, double> balanceChanges = {};
+      final catNotifier = _ref.read(categoriesProvider.notifier);
+
+      for (final split in splits) {
+        final rawCat = split['category'] as Category;
+        final amt = (split['amount'] as num).toDouble();
+        final amtCents = (amt * 100).round();
+        if (amtCents <= 0) continue;
+        final normalizedAmt = amtCents / 100.0;
+
+        final freshCat = freshById[rawCat.id] ?? rawCat;
         final desc = splits.length > 1
-            ? (description.isNotEmpty ? '$description (${cat.name})' : cat.name)
+            ? (description.isNotEmpty ? '$description (${freshCat.name})' : freshCat.name)
             : (description.isNotEmpty ? description : 'Expense');
 
-        final optTx = TransactionModel(
-          id: 'opt_${now.microsecondsSinceEpoch}_${cat.id}',
+        final txId = pbService.generateRecordId();
+        final tx = TransactionModel(
+          id: txId,
           description: desc,
-          amount: -amt,
+          amount: -normalizedAmt,
           type: TransactionType.expense,
-          category: cat.id,
+          category: freshCat.id,
           date: txDate,
           user: currentUserId,
         );
-        createdTxIds.add(optTx.id);
-        addOptimisticTransaction(optTx);
+
+        final created = await pbService.createTransaction(tx, syncImmediately: false);
+        createdTxIds.add(created.id);
+        addOptimisticTransaction(created);
+
+        final newCents = (freshCat.balance * 100).round() - amtCents;
+        final updatedCat = freshCat.copyWith(
+          balance: newCents < 0 ? 0.0 : newCents / 100.0,
+        );
+        await pbService.updateCategory(updatedCat, syncImmediately: false);
+        freshById[freshCat.id] = updatedCat;
+        catNotifier.updateOptimisticCategory(updatedCat);
+
+        balanceChanges[freshCat.id] =
+            (((balanceChanges[freshCat.id] ?? 0.0) * 100).round() - amtCents) / 100.0;
       }
 
-      _ref.read(categoriesProvider.notifier).updateOptimisticBalances(balanceChanges);
-
-      _setUndoAction(UndoAction(
+      await _setUndoAction(UndoAction(
         description: 'Log split expense: $description',
         createdTransactionIds: createdTxIds,
         updatedTransactions: [],
         categoryBalanceChanges: balanceChanges,
       ));
 
-      // 2. Background persistence & cloud sync
-      unawaited(() async {
-        try {
-          for (final split in splits) {
-            final cat = split['category'] as Category;
-            final amt = (split['amount'] as num).toDouble();
-            if (amt <= 0) continue;
-
-            final desc = splits.length > 1
-                ? (description.isNotEmpty ? '$description (${cat.name})' : cat.name)
-                : (description.isNotEmpty ? description : 'Expense');
-
-            final tx = TransactionModel(
-              id: '',
-              description: desc,
-              amount: -amt, // Negative for expense
-              type: TransactionType.expense,
-              category: cat.id,
-              date: txDate,
-              user: currentUserId,
-            );
-
-            await pbService.createTransaction(tx, syncImmediately: false);
-
-            final freshCat = pbService.categories.firstWhere(
-              (c) => c.id == cat.id,
-              orElse: () => cat,
-            );
-            final updatedCat = freshCat.copyWith(
-              balance: (((freshCat.balance * 100).round() - (amt * 100).round()) / 100.0),
-            );
-            await pbService.updateCategory(updatedCat, syncImmediately: false);
-          }
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in addSplitExpense: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in addSplitExpense: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -363,109 +379,125 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
     try {
       final pbService = _ref.read(pbServiceProvider);
       final currentUserId = pbService.currentUserId ?? '';
-      final now = DateTime.now();
-      final txDate = date ?? now;
+      final txDate = date ?? DateTime.now();
+
+      final Map<String, Category> localCategories = {
+        for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+        for (final cat in pbService.categories) cat.id: cat,
+      };
+
+      // Pre-validate that every covering source envelope and the destination envelope stay >= 0.0
+      final expenseCents = (amount * 100).round();
+      if (expenseCents <= 0) return false;
+
+      final Map<String, int> sourceDrawCents = {};
+      int totalCoverageCents = 0;
+      for (final entry in coverages.entries) {
+        final tCents = (entry.value * 100).round();
+        if (tCents <= 0) continue;
+        sourceDrawCents[entry.key.id] = (sourceDrawCents[entry.key.id] ?? 0) + tCents;
+        totalCoverageCents += tCents;
+      }
+      for (final entry in sourceDrawCents.entries) {
+        final src = localCategories[entry.key];
+        if (src == null || (src.balance * 100).round() < entry.value) {
+          return false;
+        }
+      }
+      final destCat = localCategories[category.id] ?? category;
+      if ((destCat.balance * 100).round() + totalCoverageCents < expenseCents) {
+        return false;
+      }
 
       final List<String> createdTxIds = [];
       final Map<String, double> balanceChanges = {};
+      final catNotifier = _ref.read(categoriesProvider.notifier);
 
-      // 1. Optimistic updates
       for (final entry in coverages.entries) {
         final sourceCat = entry.key;
-        final transferAmount = entry.value;
-        if (transferAmount <= 0) continue;
+        final transferCents = (entry.value * 100).round();
+        if (transferCents <= 0) continue;
+        final transferAmount = transferCents / 100.0;
 
-        balanceChanges[sourceCat.id] = (balanceChanges[sourceCat.id] ?? 0.0) - transferAmount;
-        balanceChanges[category.id] = (balanceChanges[category.id] ?? 0.0) + transferAmount;
+        final freshSource = localCategories[sourceCat.id] ?? sourceCat;
+        final freshDest = localCategories[category.id] ?? category;
 
-        final optTransfer = TransactionModel(
-          id: 'opt_${now.microsecondsSinceEpoch}_cover_${sourceCat.id}',
-          description: 'Cover deficit for ${category.name}',
+        final transferTx = TransactionModel(
+          id: pbService.generateRecordId(),
+          description: 'Cover deficit for ${freshDest.name}',
           amount: transferAmount,
           type: TransactionType.transfer,
-          sourceCategory: sourceCat.id,
-          destinationCategory: category.id,
+          sourceCategory: freshSource.id,
+          destinationCategory: freshDest.id,
           date: txDate,
           user: currentUserId,
         );
-        createdTxIds.add(optTransfer.id);
-        addOptimisticTransaction(optTransfer);
+
+        final createdTransfer = await pbService.logTransfer(
+          transferTx,
+          freshSource,
+          freshDest,
+          syncImmediately: false,
+        );
+        createdTxIds.add(createdTransfer.id);
+        addOptimisticTransaction(createdTransfer);
+
+        final updatedSource = freshSource.copyWith(
+          balance: ((freshSource.balance * 100).round() - transferCents) / 100.0,
+        );
+        final updatedDest = freshDest.copyWith(
+          balance: ((freshDest.balance * 100).round() + transferCents) / 100.0,
+        );
+        localCategories[freshSource.id] = updatedSource;
+        localCategories[freshDest.id] = updatedDest;
+        catNotifier.updateOptimisticCategory(updatedSource);
+        catNotifier.updateOptimisticCategory(updatedDest);
+
+        balanceChanges[freshSource.id] =
+            (((balanceChanges[freshSource.id] ?? 0.0) * 100).round() - transferCents) / 100.0;
+        balanceChanges[freshDest.id] =
+            (((balanceChanges[freshDest.id] ?? 0.0) * 100).round() + transferCents) / 100.0;
       }
 
-      balanceChanges[category.id] = (balanceChanges[category.id] ?? 0.0) - amount;
-      final optExpense = TransactionModel(
-        id: 'opt_${now.microsecondsSinceEpoch}_exp',
+      final freshDestCategory = localCategories[category.id] ?? category;
+      final expenseTx = TransactionModel(
+        id: pbService.generateRecordId(),
         description: description,
-        amount: -amount,
+        amount: -(expenseCents / 100.0),
         type: TransactionType.expense,
-        category: category.id,
+        category: freshDestCategory.id,
         date: txDate,
         user: currentUserId,
       );
-      createdTxIds.add(optExpense.id);
-      addOptimisticTransaction(optExpense);
+      final createdExpense = await pbService.logExpense(
+        expenseTx,
+        freshDestCategory,
+        syncImmediately: false,
+      );
+      createdTxIds.add(createdExpense.id);
+      addOptimisticTransaction(createdExpense);
 
-      _ref.read(categoriesProvider.notifier).updateOptimisticBalances(balanceChanges);
+      final finalDest = pbService.categories
+              .where((c) => c.id == freshDestCategory.id)
+              .firstOrNull ??
+          freshDestCategory.copyWith(
+            balance: ((freshDestCategory.balance * 100).round() - expenseCents) / 100.0,
+          );
+      catNotifier.updateOptimisticCategory(finalDest);
 
-      _setUndoAction(UndoAction(
-        description: 'Log expense to ${category.name} (with coverage)',
+      balanceChanges[freshDestCategory.id] =
+          (((balanceChanges[freshDestCategory.id] ?? 0.0) * 100).round() - expenseCents) / 100.0;
+
+      await _setUndoAction(UndoAction(
+        description: 'Log expense to ${freshDestCategory.name} (with coverage)',
         createdTransactionIds: createdTxIds,
         updatedTransactions: [],
         categoryBalanceChanges: balanceChanges,
       ));
 
-      // 2. Background persistence
-      unawaited(() async {
-        try {
-          final Map<String, Category> localCategories = {
-            for (final cat in _ref.read(categoriesProvider)) cat.id: cat
-          };
-
-          for (final entry in coverages.entries) {
-            final sourceCat = entry.key;
-            final transferAmount = entry.value;
-            if (transferAmount <= 0) continue;
-
-            final transferTx = TransactionModel(
-              id: '',
-              description: 'Cover deficit for ${category.name}',
-              amount: transferAmount,
-              type: TransactionType.transfer,
-              sourceCategory: sourceCat.id,
-              destinationCategory: category.id,
-              date: txDate,
-              user: currentUserId,
-            );
-
-            final freshSource = localCategories[sourceCat.id] ?? sourceCat;
-            final freshDest = localCategories[category.id] ?? category;
-
-            await pbService.logTransfer(transferTx, freshSource, freshDest, syncImmediately: false);
-
-            localCategories[sourceCat.id] = freshSource.copyWith(
-              balance: freshSource.balance - transferAmount,
-            );
-            localCategories[category.id] = freshDest.copyWith(
-              balance: freshDest.balance + transferAmount,
-            );
-          }
-
-          final freshDestCategory = localCategories[category.id] ?? category;
-          final expenseTx = TransactionModel(
-            id: '',
-            description: description,
-            amount: -amount,
-            type: TransactionType.expense,
-            category: category.id,
-            date: txDate,
-            user: currentUserId,
-          );
-          await pbService.logExpense(expenseTx, freshDestCategory, syncImmediately: false);
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in addExpenseWithCoverage: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in addExpenseWithCoverage: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -483,12 +515,15 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
   }) async {
     try {
       final pbService = _ref.read(pbServiceProvider);
-      final freshCategories = _ref.read(categoriesProvider);
-      final now = DateTime.now();
-      final txDate = date ?? now;
+      final Map<String, Category> freshById = {
+        for (final c in _ref.read(categoriesProvider)) c.id: c,
+        for (final c in pbService.categories) c.id: c,
+      };
+      final txDate = date ?? DateTime.now();
       final currentUserId = pbService.currentUserId ?? '';
-      
-      Category? unallocated = freshCategories.where((cat) => cat.isUnallocated).firstOrNull;
+
+      Category? unallocated =
+          freshById.values.where((cat) => cat.isUnallocated).firstOrNull;
       if (unallocated == null) {
         final allCats = await pbService.fetchCategories();
         unallocated = allCats.where((c) => c.isUnallocated).firstOrNull;
@@ -512,89 +547,72 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
         );
       }
 
-      // Calculate balances & apply optimistically
+      // Pre-validate that distributions never leave unallocated negative
+      final amountCents = (amount * 100).round();
+      int totalAllocatedCents = 0;
+      final List<Map<String, dynamic>> preparedDistributions = [];
       final Map<String, double> balanceChanges = {};
-      double totalAllocated = 0.0;
-      final List<String> optTxIds = [];
 
-      final optIncome = TransactionModel(
-        id: 'opt_${now.microsecondsSinceEpoch}_inc',
+      for (final dist in distributions) {
+        final rawCat = dist['category'] as Category;
+        final freshCat = freshById[rawCat.id] ?? rawCat;
+        final amt = (dist['amount'] as num).toDouble();
+        final amtCents = (amt * 100).round();
+        if (amtCents <= 0 || freshCat.isUnallocated) continue;
+
+        totalAllocatedCents += amtCents;
+        balanceChanges[freshCat.id] =
+            (((balanceChanges[freshCat.id] ?? 0.0) * 100).round() + amtCents) / 100.0;
+        preparedDistributions.add({
+          'id': pbService.generateRecordId(),
+          'category': freshCat,
+          'amount': amtCents / 100.0,
+        });
+      }
+
+      if ((unallocated.balance * 100).round() + amountCents < totalAllocatedCents) {
+        return false;
+      }
+      balanceChanges[unallocated.id] = (amountCents - totalAllocatedCents) / 100.0;
+
+      final incomeTx = TransactionModel(
+        id: pbService.generateRecordId(),
         description: description,
-        amount: amount,
+        amount: amountCents / 100.0,
         type: TransactionType.income,
         category: unallocated.id,
         date: txDate,
         user: currentUserId,
       );
-      optTxIds.add(optIncome.id);
-      addOptimisticTransaction(optIncome);
 
-      for (final dist in distributions) {
-        final cat = dist['category'] as Category;
-        final amt = (dist['amount'] as num).toDouble();
-        if (amt > 0) {
-          balanceChanges[cat.id] = amt;
-          totalAllocated += amt;
+      final createdTxs = await pbService.logIncomeAndDistribute(
+        incomeTx,
+        unallocated,
+        preparedDistributions,
+        syncImmediately: false,
+      );
 
-          final optDist = TransactionModel(
-            id: 'opt_${now.microsecondsSinceEpoch}_dist_${cat.id}',
-            description: 'Allocated from: $description',
-            amount: amt,
-            type: TransactionType.transfer,
-            sourceCategory: unallocated.id,
-            destinationCategory: cat.id,
-            date: txDate,
-            user: currentUserId,
-          );
-          optTxIds.add(optDist.id);
-          addOptimisticTransaction(optDist);
+      final catNotifier = _ref.read(categoriesProvider.notifier);
+      for (final tx in createdTxs) {
+        addOptimisticTransaction(tx);
+      }
+      for (final catId in balanceChanges.keys) {
+        final updated = pbService.categories.where((c) => c.id == catId).firstOrNull;
+        if (updated != null) {
+          catNotifier.updateOptimisticCategory(updated);
         }
       }
-      balanceChanges[unallocated.id] = amount - totalAllocated;
 
-      _ref.read(categoriesProvider.notifier).updateOptimisticBalances(balanceChanges);
-
-      _setUndoAction(UndoAction(
+      await _setUndoAction(UndoAction(
         description: 'Deposit Paycheck',
-        createdTransactionIds: optTxIds,
+        createdTransactionIds: createdTxs.map((t) => t.id).toList(),
         updatedTransactions: [],
         categoryBalanceChanges: balanceChanges,
       ));
 
-      // Background sync
-      final unallocFinal = unallocated;
-      unawaited(() async {
-        try {
-          final incomeTx = TransactionModel(
-            id: '',
-            description: description,
-            amount: amount,
-            type: TransactionType.income,
-            category: unallocFinal.id,
-            date: txDate,
-            user: currentUserId,
-          );
-
-          final freshDistributions = distributions.map((dist) {
-            final cat = dist['category'] as Category;
-            final freshCat = freshCategories.where((c) => c.id == cat.id).firstOrNull ?? cat;
-            return {
-              'category': freshCat,
-              'amount': (dist['amount'] as num).toDouble(),
-            };
-          }).toList();
-
-          await pbService.logIncomeAndDistribute(
-            incomeTx,
-            unallocFinal,
-            freshDistributions,
-            syncImmediately: false,
-          );
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in addIncomeWithDistributions: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in addIncomeWithDistributions: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -614,67 +632,77 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
     try {
       final pbService = _ref.read(pbServiceProvider);
       final currentUserId = pbService.currentUserId ?? '';
-      final now = DateTime.now();
-      final txDate = date ?? now;
+      final txDate = date ?? DateTime.now();
 
-      // 1. Optimistic updates immediately to category & transaction states
-      _ref.read(categoriesProvider.notifier).updateOptimisticBalances({
-        source.id: -amount,
-        destination.id: amount,
-      });
+      final freshSource = pbService.categories
+              .where((c) => c.id == source.id)
+              .firstOrNull ??
+          _ref.read(categoriesProvider)
+              .where((c) => c.id == source.id)
+              .firstOrNull ??
+          source;
+      final freshDest = pbService.categories
+              .where((c) => c.id == destination.id)
+              .firstOrNull ??
+          _ref.read(categoriesProvider)
+              .where((c) => c.id == destination.id)
+              .firstOrNull ??
+          destination;
 
-      final optTx = TransactionModel(
-        id: 'opt_${now.microsecondsSinceEpoch}_xfer',
+      final amountCents = (amount * 100).round();
+      if (amountCents <= 0) return false;
+      if ((freshSource.balance * 100).round() < amountCents) {
+        return false;
+      }
+
+      final transferTx = TransactionModel(
+        id: pbService.generateRecordId(),
         description: description,
-        amount: amount,
+        amount: amountCents / 100.0,
         type: TransactionType.transfer,
-        sourceCategory: source.id,
-        destinationCategory: destination.id,
+        sourceCategory: freshSource.id,
+        destinationCategory: freshDest.id,
         date: txDate,
         user: currentUserId,
       );
-      addOptimisticTransaction(optTx);
 
-      _setUndoAction(UndoAction(
-        description: 'Transfer from ${source.name} to ${destination.name}',
-        createdTransactionIds: [optTx.id],
+      final created = await pbService.logTransfer(
+        transferTx,
+        freshSource,
+        freshDest,
+        syncImmediately: false,
+      );
+
+      addOptimisticTransaction(created);
+      final catNotifier = _ref.read(categoriesProvider.notifier);
+      final updatedSource = pbService.categories
+              .where((c) => c.id == freshSource.id)
+              .firstOrNull ??
+          freshSource.copyWith(
+            balance: ((freshSource.balance * 100).round() - amountCents) / 100.0,
+          );
+      final updatedDest = pbService.categories
+              .where((c) => c.id == freshDest.id)
+              .firstOrNull ??
+          freshDest.copyWith(
+            balance: ((freshDest.balance * 100).round() + amountCents) / 100.0,
+          );
+      catNotifier.updateOptimisticCategory(updatedSource);
+      catNotifier.updateOptimisticCategory(updatedDest);
+
+      await _setUndoAction(UndoAction(
+        description: 'Transfer from ${freshSource.name} to ${freshDest.name}',
+        createdTransactionIds: [created.id],
         updatedTransactions: [],
         categoryBalanceChanges: {
-          source.id: -amount,
-          destination.id: amount,
+          freshSource.id: -(amountCents / 100.0),
+          freshDest.id: amountCents / 100.0,
         },
       ));
 
-      // 2. Background persistence & sync
-      unawaited(() async {
-        try {
-          final transferTx = TransactionModel(
-            id: '',
-            description: description,
-            amount: amount,
-            type: TransactionType.transfer,
-            sourceCategory: source.id,
-            destinationCategory: destination.id,
-            date: txDate,
-            user: currentUserId,
-          );
-
-          final freshCategories = pbService.categories;
-          final freshSource = freshCategories.firstWhere(
-            (c) => c.id == source.id,
-            orElse: () => source,
-          );
-          final freshDest = freshCategories.firstWhere(
-            (c) => c.id == destination.id,
-            orElse: () => destination,
-          );
-
-          await pbService.logTransfer(transferTx, freshSource, freshDest, syncImmediately: false);
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in addTransfer: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in addTransfer: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -692,78 +720,69 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
       final currentUserId = pbService.currentUserId ?? '';
       final now = DateTime.now();
 
-      // 1. Optimistic updates
-      final Map<String, double> balanceChanges = {};
-      final List<String> optTxIds = [];
+      final Map<String, Category> localCategories = {
+        for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+        for (final cat in pbService.categories) cat.id: cat,
+      };
+      final freshCat = localCategories[category.id] ?? category;
 
+      // Validate total distributions do not exceed source balance
+      int totalDistCents = 0;
       for (final entry in distributions.entries) {
-        final targetCat = entry.key;
-        final transferAmount = entry.value;
-        if (transferAmount <= 0) continue;
-
-        balanceChanges[targetCat.id] = (balanceChanges[targetCat.id] ?? 0.0) + transferAmount;
-
-        final optTx = TransactionModel(
-          id: 'opt_${now.microsecondsSinceEpoch}_del_${targetCat.id}',
-          description: 'Empty balance for deleted envelope "${category.name}"',
-          amount: transferAmount,
-          type: TransactionType.transfer,
-          sourceCategory: category.id,
-          destinationCategory: targetCat.id,
-          date: now,
-          user: currentUserId,
-        );
-        optTxIds.add(optTx.id);
-        addOptimisticTransaction(optTx);
+        final tCents = (entry.value * 100).round();
+        if (tCents > 0) totalDistCents += tCents;
+      }
+      if ((freshCat.balance * 100).round() < totalDistCents) {
+        return false;
       }
 
       final catNotifier = _ref.read(categoriesProvider.notifier);
-      catNotifier.updateOptimisticBalances(balanceChanges);
-      // Remove deleted category optimistically from provider
-      catNotifier.state = catNotifier.state.where((c) => c.id != category.id).toList();
 
-      // 2. Background persistence & sync
-      unawaited(() async {
-        try {
-          final Map<String, Category> localCategories = {
-            for (final cat in pbService.categories) cat.id: cat
-          };
+      for (final entry in distributions.entries) {
+        final targetCat = entry.key;
+        final transferCents = (entry.value * 100).round();
+        if (transferCents <= 0) continue;
+        final transferAmount = transferCents / 100.0;
 
-          for (final entry in distributions.entries) {
-            final targetCat = entry.key;
-            final transferAmount = entry.value;
-            if (transferAmount <= 0) continue;
+        final freshSource = localCategories[freshCat.id] ?? freshCat;
+        final freshDest = localCategories[targetCat.id] ?? targetCat;
 
-            final transferTx = TransactionModel(
-              id: '',
-              description: 'Empty balance for deleted envelope "${category.name}"',
-              amount: transferAmount,
-              type: TransactionType.transfer,
-              sourceCategory: category.id,
-              destinationCategory: targetCat.id,
-              date: now,
-              user: currentUserId,
-            );
+        final transferTx = TransactionModel(
+          id: pbService.generateRecordId(),
+          description: 'Empty balance for deleted envelope "${freshCat.name}"',
+          amount: transferAmount,
+          type: TransactionType.transfer,
+          sourceCategory: freshSource.id,
+          destinationCategory: freshDest.id,
+          date: now,
+          user: currentUserId,
+        );
 
-            final freshSource = localCategories[category.id] ?? category;
-            final freshDest = localCategories[targetCat.id] ?? targetCat;
+        final created = await pbService.logTransfer(
+          transferTx,
+          freshSource,
+          freshDest,
+          syncImmediately: false,
+        );
+        addOptimisticTransaction(created);
 
-            await pbService.logTransfer(transferTx, freshSource, freshDest, syncImmediately: false);
+        final updatedSource = freshSource.copyWith(
+          balance: ((freshSource.balance * 100).round() - transferCents) / 100.0,
+        );
+        final updatedDest = freshDest.copyWith(
+          balance: ((freshDest.balance * 100).round() + transferCents) / 100.0,
+        );
+        localCategories[freshSource.id] = updatedSource;
+        localCategories[freshDest.id] = updatedDest;
+        catNotifier.updateOptimisticCategory(updatedDest);
+      }
 
-            localCategories[category.id] = freshSource.copyWith(
-              balance: freshSource.balance - transferAmount,
-            );
-            localCategories[targetCat.id] = freshDest.copyWith(
-              balance: freshDest.balance + transferAmount,
-            );
-          }
+      await pbService.deleteCategory(freshCat.id, syncImmediately: false);
+      catNotifier.state = catNotifier.state.where((c) => c.id != freshCat.id).toList();
 
-          await pbService.deleteCategory(category.id, syncImmediately: false);
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in distributeBalanceAndDeleteCategory: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in distributeBalanceAndDeleteCategory: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -781,82 +800,81 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
       final currentUserId = pbService.currentUserId ?? '';
       final now = DateTime.now();
 
-      // 1. Optimistic updates
+      final Map<String, Category> localCategories = {
+        for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+        for (final cat in pbService.categories) cat.id: cat,
+      };
+      final freshUnalloc = localCategories[unallocatedCategory.id] ?? unallocatedCategory;
+
+      int totalDistCents = 0;
+      for (final entry in distributions.entries) {
+        final tCents = (entry.value * 100).round();
+        if (tCents > 0) totalDistCents += tCents;
+      }
+      if ((freshUnalloc.balance * 100).round() < totalDistCents) {
+        return false;
+      }
+
       final Map<String, double> balanceChanges = {};
-      final List<String> optTxIds = [];
+      final List<String> createdTxIds = [];
+      final catNotifier = _ref.read(categoriesProvider.notifier);
 
       for (final entry in distributions.entries) {
         final targetCat = entry.key;
-        final transferAmount = entry.value;
-        if (transferAmount <= 0) continue;
+        final transferCents = (entry.value * 100).round();
+        if (transferCents <= 0) continue;
+        final transferAmount = transferCents / 100.0;
 
-        balanceChanges[unallocatedCategory.id] = (balanceChanges[unallocatedCategory.id] ?? 0.0) - transferAmount;
-        balanceChanges[targetCat.id] = (balanceChanges[targetCat.id] ?? 0.0) + transferAmount;
+        final freshSource = localCategories[freshUnalloc.id] ?? freshUnalloc;
+        final freshDest = localCategories[targetCat.id] ?? targetCat;
 
-        final optTx = TransactionModel(
-          id: 'opt_${now.microsecondsSinceEpoch}_unalloc_${targetCat.id}',
+        final transferTx = TransactionModel(
+          id: pbService.generateRecordId(),
           description: 'Allocated from Unallocated Funds',
           amount: transferAmount,
           type: TransactionType.transfer,
-          sourceCategory: unallocatedCategory.id,
-          destinationCategory: targetCat.id,
+          sourceCategory: freshSource.id,
+          destinationCategory: freshDest.id,
           date: now,
           user: currentUserId,
         );
-        optTxIds.add(optTx.id);
-        addOptimisticTransaction(optTx);
+
+        final created = await pbService.logTransfer(
+          transferTx,
+          freshSource,
+          freshDest,
+          syncImmediately: false,
+        );
+        createdTxIds.add(created.id);
+        addOptimisticTransaction(created);
+
+        final updatedSource = freshSource.copyWith(
+          balance: ((freshSource.balance * 100).round() - transferCents) / 100.0,
+        );
+        final updatedDest = freshDest.copyWith(
+          balance: ((freshDest.balance * 100).round() + transferCents) / 100.0,
+        );
+        localCategories[freshSource.id] = updatedSource;
+        localCategories[freshDest.id] = updatedDest;
+        catNotifier.updateOptimisticCategory(updatedSource);
+        catNotifier.updateOptimisticCategory(updatedDest);
+
+        balanceChanges[freshSource.id] =
+            (((balanceChanges[freshSource.id] ?? 0.0) * 100).round() - transferCents) / 100.0;
+        balanceChanges[freshDest.id] =
+            (((balanceChanges[freshDest.id] ?? 0.0) * 100).round() + transferCents) / 100.0;
       }
 
-      _ref.read(categoriesProvider.notifier).updateOptimisticBalances(balanceChanges);
-
-      _setUndoAction(UndoAction(
+      await _setUndoAction(UndoAction(
         description: 'Allocate Unallocated Funds',
-        createdTransactionIds: optTxIds,
+        createdTransactionIds: createdTxIds,
         updatedTransactions: [],
         categoryBalanceChanges: balanceChanges,
       ));
 
-      // 2. Background sync
-      unawaited(() async {
-        try {
-          final Map<String, Category> localCategories = {
-            for (final cat in pbService.categories) cat.id: cat
-          };
-
-          for (final entry in distributions.entries) {
-            final targetCat = entry.key;
-            final transferAmount = entry.value;
-            if (transferAmount <= 0) continue;
-
-            final transferTx = TransactionModel(
-              id: '',
-              description: 'Allocated from Unallocated Funds',
-              amount: transferAmount,
-              type: TransactionType.transfer,
-              sourceCategory: unallocatedCategory.id,
-              destinationCategory: targetCat.id,
-              date: now,
-              user: currentUserId,
-            );
-
-            final freshSource = localCategories[unallocatedCategory.id] ?? unallocatedCategory;
-            final freshDest = localCategories[targetCat.id] ?? targetCat;
-
-            await pbService.logTransfer(transferTx, freshSource, freshDest, syncImmediately: false);
-
-            localCategories[unallocatedCategory.id] = freshSource.copyWith(
-              balance: freshSource.balance - transferAmount,
-            );
-            localCategories[targetCat.id] = freshDest.copyWith(
-              balance: freshDest.balance + transferAmount,
-            );
-          }
-
-          await pbService.syncVaultToCloud();
-        } catch (e) {
-          print("Background sync error in distributeUnallocatedFunds: $e");
-        }
-      }());
+      unawaited(pbService.syncVaultToCloud().catchError((e) {
+        print("Background sync error in distributeUnallocatedFunds: $e");
+      }));
 
       return true;
     } catch (e) {
@@ -890,8 +908,33 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
       final currentUserId = pbService.currentUserId ?? '';
       
       final Map<String, Category> localCategories = {
-        for (final cat in _ref.read(categoriesProvider)) cat.id: cat
+        for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+        for (final cat in pbService.categories) cat.id: cat,
       };
+
+      // Pre-validate non-negative balances before mutating
+      if (transaction.type != TransactionType.income) {
+        final expenseCents = (transaction.amount.abs() * 100).round();
+        final Map<String, int> srcDraw = {};
+        int totalCoverageCents = 0;
+        for (final entry in coverages.entries) {
+          final tCents = (entry.value * 100).round();
+          if (tCents <= 0) continue;
+          srcDraw[entry.key.id] = (srcDraw[entry.key.id] ?? 0) + tCents;
+          totalCoverageCents += tCents;
+        }
+        for (final entry in srcDraw.entries) {
+          final src = localCategories[entry.key];
+          if (src == null || (src.balance * 100).round() < entry.value) {
+            return false;
+          }
+        }
+        final dest = localCategories[category.id];
+        if (dest == null ||
+            (dest.balance * 100).round() + totalCoverageCents < expenseCents) {
+          return false;
+        }
+      }
 
       final List<String> createdTxIds = [];
       final Map<String, double> balanceChanges = {};
@@ -1007,8 +1050,35 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
       final currentUserId = pbService.currentUserId ?? '';
 
       final Map<String, Category> localCategories = {
-        for (final cat in _ref.read(categoriesProvider)) cat.id: cat
+        for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+        for (final cat in pbService.categories) cat.id: cat,
       };
+
+      // Pre-validate non-negative balances across all splits & coverages before mutating
+      if (transaction.type != TransactionType.income) {
+        final Map<String, int> simCents = {
+          for (final entry in localCategories.entries)
+            entry.key: (entry.value.balance * 100).round(),
+        };
+        for (final split in splits) {
+          final category = split['category'] as Category;
+          final coverages = split['coverages'] as Map<Category, double>;
+          for (final entry in coverages.entries) {
+            final tCents = (entry.value * 100).round();
+            if (tCents <= 0) continue;
+            simCents[entry.key.id] = (simCents[entry.key.id] ?? 0) - tCents;
+            simCents[category.id] = (simCents[category.id] ?? 0) + tCents;
+          }
+        }
+        for (final split in splits) {
+          final category = split['category'] as Category;
+          final amtCents = ((split['amount'] as num).toDouble() * 100).round();
+          simCents[category.id] = (simCents[category.id] ?? 0) - amtCents;
+        }
+        if (simCents.values.any((c) => c < 0)) {
+          return false;
+        }
+      }
 
       final List<String> createdTxIds = [];
       final Map<String, double> balanceChanges = {};
@@ -1154,18 +1224,23 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
 
   Future<bool> undoLastAction() async {
     if (_lastUndoAction == null) return false;
-    
+
     final action = _lastUndoAction!;
     final pbService = _ref.read(pbServiceProvider);
-    
+    final catNotifier = _ref.read(categoriesProvider.notifier);
+
     try {
       // 1. Delete all transactions created in this action
+      final deletedSet = action.createdTransactionIds.toSet();
       for (final txId in action.createdTransactionIds) {
         try {
           await pbService.deleteTransaction(txId, syncImmediately: false);
         } catch (e) {
           print("Error deleting transaction $txId during undo: $e");
         }
+      }
+      if (deletedSet.isNotEmpty) {
+        state = state.where((tx) => !deletedSet.contains(tx.id)).toList();
       }
 
       // 2. Revert any updated transactions to their original state
@@ -1177,22 +1252,23 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
               category: info.originalCategory,
               amount: info.originalAmount,
             );
-            await pbService.updateTransaction(
+            final updated = await pbService.updateTransaction(
               revertedTx,
               clearCategory: info.originalCategory == null,
               syncImmediately: false,
             );
+            addOptimisticTransaction(updated);
           }
         } catch (e) {
           print("Error reverting transaction ${info.transactionId} during undo: $e");
         }
       }
 
-      // 3. Revert category balances (subtract the balance changes)
+      // 3. Revert category balances (subtract the applied delta, clamped >= 0.0)
       if (action.categoryBalanceChanges.isNotEmpty) {
-        final freshCategoriesList = await pbService.fetchCategories();
         final Map<String, Category> categoriesMap = {
-          for (final cat in freshCategoriesList) cat.id: cat
+          for (final cat in _ref.read(categoriesProvider)) cat.id: cat,
+          for (final cat in pbService.categories) cat.id: cat,
         };
 
         for (final entry in action.categoryBalanceChanges.entries) {
@@ -1201,13 +1277,19 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
 
           final category = categoriesMap[categoryId];
           if (category != null) {
+            final currentCents = (category.balance * 100).round();
+            final deltaCents = (balanceChange * 100).round();
+            final revertedCents = currentCents - deltaCents;
+            final revertedBalance =
+                revertedCents < 0 ? 0.0 : revertedCents / 100.0;
             final revertedCategory = category.copyWith(
-              balance: category.balance - balanceChange,
+              balance: revertedBalance,
             );
             await pbService.updateCategory(
               revertedCategory,
               syncImmediately: false,
             );
+            catNotifier.updateOptimisticCategory(revertedCategory);
           }
         }
       }
@@ -1224,15 +1306,12 @@ class TransactionsNotifier extends StateNotifier<List<TransactionModel>> {
         }
       }
 
-      unawaited(pbService.syncVaultToCloud().catchError((_) {}));
-
       // 5. Clear the action state
       await _clearUndoAction();
 
-      // 6. Reload categories and transactions
-      await _ref.read(categoriesProvider.notifier).loadCategories();
-      await loadTransactions();
-      
+      // 6. Sync to cloud in the background without blocking UI
+      unawaited(pbService.syncVaultToCloud().catchError((_) {}));
+
       return true;
     } catch (e) {
       print("Error executing undo action: $e");

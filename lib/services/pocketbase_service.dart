@@ -255,7 +255,9 @@ class PocketBaseService {
   final Map<String, Set<String>> _dirtyMonthsBySharedKey = {};
   final Set<String> _deletedTxIds = {};
   final Set<String> _deletedCatIds = {};
-  final Set<String> _promptedDuplicateKeys = {};
+  final Set<String> _sessionCreatedTxIds = {};
+  final Set<String> _unsyncedLocalTxIds = {};
+  final Set<String> _resolvedDuplicatePairs = {};
   Timer? _backgroundSyncTimer;
 
   /// Starts periodic background sync (every 45s) while authenticated so
@@ -283,21 +285,87 @@ class PocketBaseService {
   /// identical amount + category + type but different IDs across devices.
   void Function(List<DuplicateTxPair> duplicates)? onDuplicateTransactionsDetected;
 
-  /// Detects potential duplicate transactions across [remote] and [local]
-  /// (same amount, category, and type, but different IDs).
+  /// Canonical order-independent pair key for resolved duplicate tracking.
+  static String duplicatePairKey(String idA, String idB) {
+    final ids = [idA, idB]..sort();
+    return '${ids[0]}|${ids[1]}';
+  }
+
+  /// Detects potential duplicate transactions across [remote] and [local].
+  ///
+  /// Only compares genuinely NEW remote transactions (IDs not already in
+  /// [local], not in [deletedIds], and not created by this device in
+  /// [sessionCreatedIds]) against unsynced local transactions (IDs not already
+  /// present in [remote], and restricted to [unsyncedLocalIds] if provided).
+  ///
+  /// Requires tight matching:
+  /// - different IDs
+  /// - same `category` (and same source/destination for transfers) & same `type`
+  /// - exact `amount` within `0.005`
+  /// - `date` within [maxDateDiff] (default 24 hours) of each other
+  /// - both transactions within [recencyWindow] (default 7 days) of [now]
+  ///   so historical transactions are never re-flagged
+  /// - pair not already in [resolvedPairs]
   static List<DuplicateTxPair> findPotentialDuplicates(
     List<TransactionModel> remote,
-    List<TransactionModel> local,
-  ) {
+    List<TransactionModel> local, {
+    Set<String> deletedIds = const {},
+    Set<String> sessionCreatedIds = const {},
+    Set<String>? unsyncedLocalIds,
+    Set<String> resolvedPairs = const {},
+    Duration maxDateDiff = const Duration(hours: 24),
+    Duration recencyWindow = const Duration(days: 7),
+    DateTime? now,
+  }) {
+    final referenceNow = now ?? DateTime.now();
+    final localIds = local.map((t) => t.id).toSet();
+    final remoteIds = remote.map((t) => t.id).toSet();
+
+    // Only genuinely NEW remote transactions that were not already in local
+    // and were not created by this device in this session.
+    final newRemote = remote.where((r) {
+      if (localIds.contains(r.id)) return false;
+      if (deletedIds.contains(r.id)) return false;
+      if (sessionCreatedIds.contains(r.id)) return false;
+      return true;
+    }).toList();
+
+    if (newRemote.isEmpty) return const [];
+
+    // Only unsynced local transactions not already present on the server.
+    final candidateLocal = local.where((l) {
+      if (remoteIds.contains(l.id)) return false;
+      if (deletedIds.contains(l.id)) return false;
+      if (unsyncedLocalIds != null && !unsyncedLocalIds.contains(l.id)) {
+        return false;
+      }
+      return true;
+    }).toList();
+
+    if (candidateLocal.isEmpty) return const [];
+
     final pairs = <DuplicateTxPair>[];
-    for (final l in local) {
-      for (final r in remote) {
-        if (l.id != r.id &&
-            (l.amount - r.amount).abs() < 0.001 &&
-            l.category == r.category &&
-            l.type == r.type) {
-          pairs.add(DuplicateTxPair(localTx: l, remoteTx: r));
+    final seenPairKeys = <String>{};
+
+    for (final l in candidateLocal) {
+      if (referenceNow.difference(l.date).abs() > recencyWindow) continue;
+      for (final r in newRemote) {
+        if (l.id == r.id) continue;
+        if (referenceNow.difference(r.date).abs() > recencyWindow) continue;
+        if (l.type != r.type) continue;
+        if (l.category != r.category) continue;
+        if (l.type == TransactionType.transfer &&
+            (l.sourceCategory != r.sourceCategory ||
+                l.destinationCategory != r.destinationCategory)) {
+          continue;
         }
+        if ((l.amount - r.amount).abs() >= 0.005) continue;
+        if (l.date.difference(r.date).abs() > maxDateDiff) continue;
+
+        final key = duplicatePairKey(l.id, r.id);
+        if (resolvedPairs.contains(key) || !seenPairKeys.add(key)) continue;
+
+        pairs.add(DuplicateTxPair(localTx: l, remoteTx: r));
       }
     }
     return pairs;
@@ -1351,6 +1419,11 @@ class PocketBaseService {
     _inFlightPush = null;
     _pushDepth = 0;
     _upgradedHybridGrantIds.clear();
+    _deletedTxIds.clear();
+    _deletedCatIds.clear();
+    _sessionCreatedTxIds.clear();
+    _unsyncedLocalTxIds.clear();
+    _resolvedDuplicatePairs.clear();
   }
 
   /// Permanently purges the authenticated user's owned StiQRcloud records
@@ -1604,22 +1677,62 @@ class PocketBaseService {
 
   // --- Pushing Dirty Shards & Meta to StiQRcloud ---
 
-  void _notifyIfDuplicates(
+  /// Marks a duplicate transaction pair as resolved/dismissed so it will never
+  /// be prompted again on subsequent syncs or app restarts.
+  Future<void> markDuplicatePairResolved(String idA, String idB) async {
+    final key = duplicatePairKey(idA, idB);
+    if (_resolvedDuplicatePairs.add(key)) {
+      await _saveStateToLocalCache();
+    }
+  }
+
+  /// Resolves a duplicate pair by deleting [pair.remoteTx], marking it in
+  /// `_deletedTxIds`, marking the pair resolved, and syncing immediately so
+  /// the duplicate never resurrects.
+  Future<void> resolveDuplicateKeepOnlyOne(DuplicateTxPair pair) async {
+    final key = duplicatePairKey(pair.localTx.id, pair.remoteTx.id);
+    _resolvedDuplicatePairs.add(key);
+    // Ensure the remote transaction's month is marked dirty even if not yet in _transactions
+    _markTransactionDirty(pair.remoteTx);
+    await deleteTransaction(pair.remoteTx.id, syncImmediately: true);
+    await _saveStateToLocalCache();
+  }
+
+  /// Exposes duplicate checking for sync merge paths and unit tests.
+  @visibleForTesting
+  List<DuplicateTxPair> checkAndNotifyDuplicates(
     List<TransactionModel> remote,
-    List<TransactionModel> local,
-  ) {
-    final pairs = findPotentialDuplicates(remote, local);
+    List<TransactionModel> local, {
+    DateTime? now,
+  }) {
+    final pairs = findPotentialDuplicates(
+      remote,
+      local,
+      deletedIds: _deletedTxIds,
+      sessionCreatedIds: _sessionCreatedTxIds,
+      unsyncedLocalIds: _unsyncedLocalTxIds.isEmpty ? null : _unsyncedLocalTxIds,
+      resolvedPairs: _resolvedDuplicatePairs,
+      now: now,
+    );
     final fresh = <DuplicateTxPair>[];
     for (final p in pairs) {
-      final ids = [p.localTx.id, p.remoteTx.id]..sort();
-      final key = '${ids[0]}_${ids[1]}';
-      if (_promptedDuplicateKeys.add(key)) {
+      final key = duplicatePairKey(p.localTx.id, p.remoteTx.id);
+      if (_resolvedDuplicatePairs.add(key)) {
         fresh.add(p);
       }
     }
     if (fresh.isNotEmpty) {
+      unawaited(_saveStateToLocalCache());
       onDuplicateTransactionsDetected?.call(fresh);
     }
+    return fresh;
+  }
+
+  void _notifyIfDuplicates(
+    List<TransactionModel> remote,
+    List<TransactionModel> local,
+  ) {
+    checkAndNotifyDuplicates(remote, local);
   }
 
   void markBudgetMetaDirty(String localBudgetId) =>
@@ -1766,6 +1879,9 @@ class PocketBaseService {
             shardRecordId,
             wrappedText,
           );
+          for (final tx in mergedMonthTxs) {
+            _unsyncedLocalTxIds.remove(tx.id);
+          }
           _loadedShardRevisions
               .putIfAbsent(sharedKey, () => <String, int>{})[month] = nowMs;
           _dirtyMonthsBySharedKey[sharedKey]?.remove(month);
@@ -3085,6 +3201,8 @@ class PocketBaseService {
         'transactions': _transactions.map((t) => t.toJson()).toList(),
         'rules': _rules,
         'shardRevisions': _loadedShardRevisions,
+        'deletedTxIds': _deletedTxIds.toList(),
+        'resolvedDuplicatePairs': _resolvedDuplicatePairs.toList(),
       });
       await prefs.setString(
         '$_localCachePrefix$_currentUserPubAddress',
@@ -3105,6 +3223,17 @@ class PocketBaseService {
       if (cachedStr == null || cachedStr.isEmpty) return false;
 
       final map = jsonDecode(cachedStr) as Map<String, dynamic>;
+      if (map['deletedTxIds'] is List) {
+        _deletedTxIds.addAll(
+          (map['deletedTxIds'] as List<dynamic>).map((e) => e.toString()),
+        );
+      }
+      if (map['resolvedDuplicatePairs'] is List) {
+        _resolvedDuplicatePairs.addAll(
+          (map['resolvedDuplicatePairs'] as List<dynamic>)
+              .map((e) => e.toString()),
+        );
+      }
       final rawCats = (map['categories'] as List<dynamic>?) ?? [];
       final cachedCats = _deduplicateUnallocatedCategories(
         rawCats
@@ -3175,6 +3304,8 @@ class PocketBaseService {
     final rand = Random.secure();
     return List.generate(15, (_) => chars[rand.nextInt(chars.length)]).join();
   }
+
+  String generateRecordId() => _generateRecordId();
 
   void _emitCategoryEvent(String action, Category category) {
     final json = category.toJson();
@@ -3254,8 +3385,10 @@ class PocketBaseService {
     }
 
     final newId = category.id.isNotEmpty ? category.id : _generateRecordId();
+    final safeBalanceCents = (category.balance * 100).round();
     final created = category.copyWith(
       id: newId,
+      balance: safeBalanceCents < 0 ? 0.0 : safeBalanceCents / 100.0,
       user: currentUserId ?? '',
     );
 
@@ -3283,7 +3416,9 @@ class PocketBaseService {
       throw Exception('This shared budget is View-Only.');
     }
 
+    final safeBalanceCents = (category.balance * 100).round();
     final updated = category.copyWith(
+      balance: safeBalanceCents < 0 ? 0.0 : safeBalanceCents / 100.0,
       user: currentUserId ?? category.user,
     );
 
@@ -3396,6 +3531,8 @@ class PocketBaseService {
       user: currentUserId ?? '',
     );
 
+    _sessionCreatedTxIds.add(newId);
+    _unsyncedLocalTxIds.add(newId);
     _transactions = [
       created,
       ..._transactions.where((t) => t.id != newId),
@@ -3479,6 +3616,7 @@ class PocketBaseService {
     }
 
     _deletedTxIds.add(id);
+    _unsyncedLocalTxIds.remove(id);
     _transactions = _transactions.where((t) => t.id != id).toList();
     if (removed != null) {
       _emitTransactionEvent('delete', removed);
@@ -3560,8 +3698,9 @@ class PocketBaseService {
       throw Exception('This shared budget is View-Only.');
     }
     final catCents = (currentCat.balance * 100).round();
-    final expenseCents = (transaction.amount.abs() * 100).round();
-    if (catCents < expenseCents && transaction.amount < 0) {
+    final deltaCents = (transaction.amount * 100).round();
+    final newCents = catCents + deltaCents;
+    if (newCents < 0) {
       throw Exception('Category has insufficient funds');
     }
 
@@ -3571,7 +3710,7 @@ class PocketBaseService {
     );
 
     final updatedCategory = currentCat.copyWith(
-      balance: ((catCents + (transaction.amount * 100).round()) / 100.0),
+      balance: newCents / 100.0,
     );
     await updateCategory(
       updatedCategory,
@@ -3586,12 +3725,22 @@ class PocketBaseService {
     Category destination, {
     bool syncImmediately = true,
   }) async {
-    if (isBudgetReadOnly(source.budgetId) || isBudgetReadOnly(destination.budgetId)) {
+    final currentSource = _categories.firstWhere(
+      (c) => c.id == source.id,
+      orElse: () => source,
+    );
+    final currentDest = _categories.firstWhere(
+      (c) => c.id == destination.id,
+      orElse: () => destination,
+    );
+    if (isBudgetReadOnly(currentSource.budgetId) || isBudgetReadOnly(currentDest.budgetId)) {
       throw Exception('This shared budget is View-Only.');
     }
-    final amount = transaction.amount.abs();
+    final amountCents = (transaction.amount.abs() * 100).round();
+    final sourceCents = (currentSource.balance * 100).round();
+    final destCents = (currentDest.balance * 100).round();
 
-    if (source.balance < amount) {
+    if (sourceCents < amountCents) {
       throw Exception('Source category has insufficient funds');
     }
 
@@ -3601,12 +3750,12 @@ class PocketBaseService {
     );
 
     await updateCategory(
-      source.copyWith(balance: source.balance - amount),
+      currentSource.copyWith(balance: (sourceCents - amountCents) / 100.0),
       syncImmediately: false,
     );
 
     await updateCategory(
-      destination.copyWith(balance: destination.balance + amount),
+      currentDest.copyWith(balance: (destCents + amountCents) / 100.0),
       syncImmediately: syncImmediately,
     );
 
@@ -3619,9 +3768,28 @@ class PocketBaseService {
     List<Map<String, dynamic>> distributions, {
     bool syncImmediately = true,
   }) async {
-    if (isBudgetReadOnly(unallocatedCategory.budgetId)) {
+    final freshUnalloc = _categories.firstWhere(
+      (c) => c.id == unallocatedCategory.id,
+      orElse: () => unallocatedCategory,
+    );
+    if (isBudgetReadOnly(freshUnalloc.budgetId)) {
       throw Exception('This shared budget is View-Only.');
     }
+
+    // Pre-validate that total distributions never leave unallocated negative
+    final startUnallocCents =
+        (freshUnalloc.balance * 100).round() + (incomeTx.amount * 100).round();
+    int totalDistCents = 0;
+    for (final dist in distributions) {
+      final targetCat = dist['category'] as Category;
+      final amt = (dist['amount'] as num).toDouble();
+      if (amt <= 0 || targetCat.isUnallocated) continue;
+      totalDistCents += (amt * 100).round();
+    }
+    if (startUnallocCents < totalDistCents) {
+      throw Exception('Distributions exceed available unallocated funds');
+    }
+
     final List<TransactionModel> createdTransactions = [];
 
     final createdIncome = await createTransaction(
@@ -3630,8 +3798,9 @@ class PocketBaseService {
     );
     createdTransactions.add(createdIncome);
 
-    var currentUnallocated = unallocatedCategory.copyWith(
-      balance: unallocatedCategory.balance + incomeTx.amount,
+    var currentUnallocatedCents = startUnallocCents;
+    var currentUnallocated = freshUnalloc.copyWith(
+      balance: currentUnallocatedCents / 100.0,
     );
     currentUnallocated = await updateCategory(
       currentUnallocated,
@@ -3639,15 +3808,20 @@ class PocketBaseService {
     );
 
     for (final dist in distributions) {
-      final targetCat = dist['category'] as Category;
-      final amount = dist['amount'] as double;
-      if (amount <= 0) continue;
+      final rawTargetCat = dist['category'] as Category;
+      final targetCat = _categories.firstWhere(
+        (c) => c.id == rawTargetCat.id,
+        orElse: () => rawTargetCat,
+      );
+      final amount = (dist['amount'] as num).toDouble();
+      final amountCents = (amount * 100).round();
+      if (amountCents <= 0) continue;
       if (targetCat.isUnallocated) continue;
 
       final transferTx = TransactionModel(
-        id: '',
+        id: (dist['id'] as String?) ?? '',
         description: 'Allocated from: ${incomeTx.description}',
-        amount: amount,
+        amount: amountCents / 100.0,
         type: TransactionType.transfer,
         sourceCategory: currentUnallocated.id,
         destinationCategory: targetCat.id,
@@ -3661,13 +3835,15 @@ class PocketBaseService {
       );
       createdTransactions.add(createdTransfer);
 
+      final newTargetCents = (targetCat.balance * 100).round() + amountCents;
       await updateCategory(
-        targetCat.copyWith(balance: targetCat.balance + amount),
+        targetCat.copyWith(balance: newTargetCents / 100.0),
         syncImmediately: false,
       );
 
+      currentUnallocatedCents -= amountCents;
       currentUnallocated = currentUnallocated.copyWith(
-        balance: currentUnallocated.balance - amount,
+        balance: currentUnallocatedCents < 0 ? 0.0 : currentUnallocatedCents / 100.0,
       );
     }
 

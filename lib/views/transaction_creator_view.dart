@@ -146,17 +146,38 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
     });
   }
 
+  Category? _resolveFreshCategory(Category? cat) {
+    if (cat == null) return null;
+    final categories = ref.read(categoriesProvider);
+    return categories.where((c) => c.id == cat.id).firstOrNull ?? cat;
+  }
+
+  double _otherRowsAmountForCategory(String categoryId, int excludeIndex) {
+    double sum = 0.0;
+    for (int i = 0; i < _splits.length; i++) {
+      if (i == excludeIndex) continue;
+      final c = _splits[i]['category'] as Category?;
+      if (c != null && c.id == categoryId) {
+        final ctrl = _splits[i]['controller'] as TextEditingController;
+        sum += double.tryParse(ctrl.text.trim()) ?? 0.0;
+      }
+    }
+    return ((sum * 100).roundToDouble()) / 100;
+  }
+
   void _fillMaxForSplit(int index) {
     final split = _splits[index];
-    final Category? cat = split['category'];
+    final Category? cat = _resolveFreshCategory(split['category'] as Category?);
     if (cat == null) return;
 
     final ctrl = split['controller'] as TextEditingController;
     final currentVal = double.tryParse(ctrl.text.trim()) ?? 0.0;
     final remainingExcludingSelf = _splitRemaining + currentVal;
 
-    // The max we can pull from this envelope is min(category balance, needed amount)
-    final available = cat.balance > 0 ? cat.balance : 0.0;
+    // Subtract any amount already drawn from this same envelope in other rows
+    final usedElsewhere = _otherRowsAmountForCategory(cat.id, index);
+    final rawAvailable = cat.balance - usedElsewhere;
+    final available = rawAvailable > 0 ? rawAvailable : 0.0;
     final needed = remainingExcludingSelf > 0 ? remainingExcludingSelf : 0.0;
     final fillAmount = available < needed ? available : needed;
 
@@ -176,27 +197,44 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
       }
       _splits.clear();
 
-      if (_selectedCategory != null) {
-        final cat = _selectedCategory!;
-        final initialPortion = cat.balance > 0
-            ? (cat.balance < total ? cat.balance : total)
-            : 0.0;
-        _splits.add({
-          'category': cat,
-          'controller': TextEditingController(text: initialPortion > 0 ? initialPortion.toStringAsFixed(2) : ''),
-        });
+      final selected = _resolveFreshCategory(_selectedCategory);
+      if (selected != null) {
+        double remainder = total;
+        if (selected.balance > 0) {
+          final initialPortion =
+              selected.balance < total ? selected.balance : total;
+          _splits.add({
+            'category': selected,
+            'controller': TextEditingController(
+              text: initialPortion.toStringAsFixed(2),
+            ),
+          });
+          remainder = (((total - initialPortion) * 100).round()) / 100.0;
+        }
 
-        final remainder = total - initialPortion;
-        // Suggest another category with balance > 0
-        final nextCat = categories.where((c) => c.id != cat.id && c.balance > 0).firstOrNull;
+        // Pre-select a covering envelope with positive balance (never exceeding its available funds)
+        final nextCat = categories
+            .where((c) => c.id != selected.id && c.balance > 0)
+            .firstOrNull;
         final nextPortion = nextCat != null
             ? (nextCat.balance < remainder ? nextCat.balance : remainder)
-            : remainder;
+            : 0.0;
 
         _splits.add({
           'category': nextCat,
-          'controller': TextEditingController(text: nextPortion > 0 ? nextPortion.toStringAsFixed(2) : ''),
+          'controller': TextEditingController(
+            text: nextPortion > 0 ? nextPortion.toStringAsFixed(2) : '',
+          ),
         });
+
+        // If the first covering envelope wasn't enough, add another empty row so the user can pick 1+ more
+        final stillNeeded = (((remainder - nextPortion) * 100).round()) / 100.0;
+        if (stillNeeded > 0 && _splits.length < 2) {
+          _splits.add({
+            'category': null,
+            'controller': TextEditingController(text: ''),
+          });
+        }
       } else {
         _initDefaultSplits();
       }
@@ -209,6 +247,7 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
 
     final description = _descriptionController.text.trim();
     final amount = double.parse(_amountController.text.trim());
+    final amountCents = (amount * 100).round();
     final notifier = ref.read(transactionsProvider.notifier);
 
     setState(() {
@@ -219,18 +258,22 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
       if (_isExpenseMode) {
         if (!_isSplitMode) {
           // --- Single Envelope Mode ---
-          if (_selectedCategory == null) return;
-          final category = _selectedCategory!;
+          final category = _resolveFreshCategory(_selectedCategory);
+          if (category == null) return;
 
-          if (category.balance < amount) {
-            // Insufficient funds: seamlessly switch to Split Mode so user can choose allocations
+          final catCents = (category.balance * 100).round();
+          if (catCents < amountCents) {
+            // Hard rule: never allow negative balance — require picking 1+ covering envelopes
+            final deficit = (amountCents - catCents) / 100.0;
             setState(() {
               _isSaving = false;
             });
             _switchToSplitModeFromDeficit();
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('${category.name} has \$${category.balance.toStringAsFixed(2)}. Choose split envelopes below:'),
+                content: Text(
+                  'Envelopes cannot go negative. ${category.name} is short by \$${deficit.toStringAsFixed(2)} — pick 1 or more covering envelopes below.',
+                ),
                 backgroundColor: const Color(0xFF6366F1),
                 duration: const Duration(seconds: 4),
               ),
@@ -254,7 +297,7 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
               SnackBar(
                 content: Text(
                   _splitRemaining > 0
-                      ? 'Please draw the remaining \$${_splitRemaining.toStringAsFixed(2)} to match total.'
+                      ? 'Please cover the remaining \$${_splitRemaining.toStringAsFixed(2)} across envelopes to match the total.'
                       : 'Split envelopes exceed total expense by \$${_splitRemaining.abs().toStringAsFixed(2)}.',
                 ),
                 backgroundColor: Colors.amber[800],
@@ -264,8 +307,12 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
           }
 
           final List<Map<String, dynamic>> splitsToSend = [];
+          final Map<String, int> totalCentsPerCat = {};
+          final Map<String, Category> freshCatById = {};
+
           for (final split in _splits) {
-            final cat = split['category'] as Category?;
+            final rawCat = split['category'] as Category?;
+            final cat = _resolveFreshCategory(rawCat);
             if (cat == null) {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(
@@ -278,12 +325,20 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
 
             final ctrl = split['controller'] as TextEditingController;
             final splitAmt = double.tryParse(ctrl.text.trim()) ?? 0.0;
-            if (splitAmt <= 0) continue;
+            final splitCents = (splitAmt * 100).round();
+            if (splitCents <= 0) continue;
 
-            if (splitAmt > cat.balance) {
+            freshCatById[cat.id] = cat;
+            totalCentsPerCat[cat.id] =
+                (totalCentsPerCat[cat.id] ?? 0) + splitCents;
+
+            final availCents = (cat.balance * 100).round();
+            if (totalCentsPerCat[cat.id]! > availCents) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
-                  content: Text('Cannot draw \$${splitAmt.toStringAsFixed(2)} from ${cat.name} (Only \$${cat.balance.toStringAsFixed(2)} available).'),
+                  content: Text(
+                    'Envelopes cannot go negative: total drawn from ${cat.name} (\$${(totalCentsPerCat[cat.id]! / 100.0).toStringAsFixed(2)}) exceeds available \$${cat.balance.toStringAsFixed(2)}.',
+                  ),
                   backgroundColor: Colors.redAccent,
                 ),
               );
@@ -292,7 +347,7 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
 
             splitsToSend.add({
               'category': cat,
-              'amount': splitAmt,
+              'amount': splitCents / 100.0,
             });
           }
 
@@ -316,15 +371,14 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
         }
       } else {
         // --- Transfer Mode ---
-        if (_selectedSourceCategory == null || _selectedDestCategory == null) return;
-        
-        final source = _selectedSourceCategory!;
-        final dest = _selectedDestCategory!;
+        final source = _resolveFreshCategory(_selectedSourceCategory);
+        final dest = _resolveFreshCategory(_selectedDestCategory);
+        if (source == null || dest == null) return;
 
-        if (source.balance < amount) {
+        if ((source.balance * 100).round() < amountCents) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Insufficient funds in ${source.name}. Available: \$${source.balance.toStringAsFixed(2)}'),
+              content: Text('Envelopes cannot go negative. ${source.name} only has \$${source.balance.toStringAsFixed(2)} available.'),
               backgroundColor: Colors.redAccent,
             ),
           );
@@ -684,7 +738,8 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
                     // Deficit notice if envelope funds are insufficient
                     if (_selectedCategory != null &&
                         totalAmount > 0 &&
-                        _selectedCategory!.balance < totalAmount) ...[
+                        ((_resolveFreshCategory(_selectedCategory)!.balance * 100).round() <
+                            (totalAmount * 100).round())) ...[
                       const SizedBox(height: 14),
                       Container(
                         padding: const EdgeInsets.all(14),
@@ -702,7 +757,7 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    '${_selectedCategory!.name} has \$${_selectedCategory!.balance.toStringAsFixed(2)} available. Need \$${(totalAmount - _selectedCategory!.balance).toStringAsFixed(2)} more.',
+                                    'Envelopes cannot go negative. ${_selectedCategory!.name} has \$${_resolveFreshCategory(_selectedCategory)!.balance.toStringAsFixed(2)} available — pick 1 or more covering envelopes for the remaining \$${(totalAmount - _resolveFreshCategory(_selectedCategory)!.balance).toStringAsFixed(2)}.',
                                     style: GoogleFonts.inter(fontSize: 12, color: colors.textPrimary, fontWeight: FontWeight.w600),
                                   ),
                                 ),
@@ -715,7 +770,7 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
                                 onPressed: _switchToSplitModeFromDeficit,
                                 icon: const Icon(Icons.call_split, size: 16, color: Color(0xFF06B6D4)),
                                 label: Text(
-                                  'Split Across Multiple Envelopes',
+                                  'Pick Covering Envelopes',
                                   style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.bold, color: const Color(0xFF06B6D4)),
                                 ),
                                 style: OutlinedButton.styleFrom(
@@ -882,8 +937,15 @@ class _TransactionCreatorViewState extends ConsumerState<TransactionCreatorView>
                                         final num = double.tryParse(val);
                                         if (num == null) return 'Invalid';
                                         if (num <= 0) return '> \$0';
-                                        if (selCat != null && num > selCat.balance) {
-                                          return 'Max \$${selCat.balance.toStringAsFixed(2)}';
+                                        if (selCat != null) {
+                                          final freshCat = _resolveFreshCategory(selCat)!;
+                                          final usedElsewhere =
+                                              _otherRowsAmountForCategory(freshCat.id, index);
+                                          final maxAllowed =
+                                              (((freshCat.balance - usedElsewhere) * 100).round()) / 100.0;
+                                          if ((num * 100).round() > (maxAllowed * 100).round()) {
+                                            return 'Max \$${(maxAllowed < 0 ? 0.0 : maxAllowed).toStringAsFixed(2)}';
+                                          }
                                         }
                                         return null;
                                       },

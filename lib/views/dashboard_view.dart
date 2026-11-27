@@ -145,13 +145,19 @@ class DashboardView extends ConsumerWidget {
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.of(ctx).pop(),
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  pbService.markDuplicatePairResolved(
+                    pair.localTx.id,
+                    pair.remoteTx.id,
+                  );
+                },
                 child: const Text('Keep Both'),
               ),
               FilledButton(
                 onPressed: () async {
                   Navigator.of(ctx).pop();
-                  await pbService.deleteTransaction(pair.remoteTx.id);
+                  await pbService.resolveDuplicateKeepOnlyOne(pair);
                 },
                 child: const Text('Keep Only One'),
               ),

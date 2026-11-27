@@ -91,14 +91,19 @@ class CategoriesNotifier extends StateNotifier<List<Category>> {
 
   /// Optimistically updates category balances in Riverpod state immediately.
   /// [deltas] maps categoryId -> balance change (positive or negative).
+  /// Balances are clamped at >= 0.0 so no envelope can ever go negative.
   void updateOptimisticBalances(Map<String, double> deltas) {
     if (deltas.isEmpty) return;
     final updatedList = [
       for (final cat in state)
         if (deltas.containsKey(cat.id))
-          cat.copyWith(
-            balance: (((cat.balance * 100).round() + (deltas[cat.id]! * 100).round()) / 100.0),
-          )
+          () {
+            final newCents =
+                (cat.balance * 100).round() + (deltas[cat.id]! * 100).round();
+            return cat.copyWith(
+              balance: newCents < 0 ? 0.0 : newCents / 100.0,
+            );
+          }()
         else
           cat,
     ];
@@ -107,9 +112,12 @@ class CategoriesNotifier extends StateNotifier<List<Category>> {
 
   /// Optimistically update or replace a category in Riverpod state immediately.
   void updateOptimisticCategory(Category updated) {
+    final safeCents = (updated.balance * 100).round();
+    final safeCategory =
+        safeCents < 0 ? updated.copyWith(balance: 0.0) : updated;
     final updatedList = [
       for (final cat in state)
-        if (cat.id == updated.id) updated else cat,
+        if (cat.id == safeCategory.id) safeCategory else cat,
     ];
     _applyOrderAndSetState(updatedList);
   }
